@@ -124,6 +124,9 @@ public class DLCManager : NetworkBehaviour
         
         Debug.Log($"DLCManager spawned: IsOwner={IsOwner}, IsLocalPlayer={IsLocalPlayer}, ClientId={OwnerClientId}");
         
+        // Subscribe to network variable change
+        playerProfileData.OnValueChanged += OnProfileDataChanged;
+        
         // On spawn, set initial profile data but ONLY if we're the owner
         if (IsOwner)
         {
@@ -135,10 +138,10 @@ public class DLCManager : NetworkBehaviour
             };
             
             Debug.Log($"Set initial profile data: ProfileId={selectedProfileId}, Name={PlayerPrefs.GetString("PlayerName", "Player" + NetworkManager.Singleton.LocalClientId)}");
+            
+            // Immediately broadcast our profile to others (without waiting for selection)
+            SyncProfileWithNetwork();
         }
-        
-        // Make sure everyone is subscribed to changes
-        playerProfileData.OnValueChanged += OnProfileDataChanged;
     }
 
     public override void OnDestroy()
@@ -168,6 +171,48 @@ public class DLCManager : NetworkBehaviour
             if (gameUIDLCIntegration != null)
             {
                 gameUIDLCIntegration.UpdateOtherPlayerProfile(newValue.ProfileId, newValue.PlayerName);
+            }
+        }
+    }
+
+    // New method to sync profile with network
+    public void SyncProfileWithNetwork()
+    {
+        if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsClient)
+        {
+            try
+            {
+                // Get player name, provide fallback if not found
+                string playerName = PlayerPrefs.GetString("PlayerName", "Player" + NetworkManager.Singleton.LocalClientId);
+                Debug.Log($"Auto-syncing profile with network: {selectedProfileId}, Name={playerName}");
+                
+                // Use ServerRpc to tell server about our profile
+                UpdateProfileServerRpc(selectedProfileId, playerName);
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"Error auto-syncing profile on server: {e.Message}");
+            }
+        }
+        else
+        {
+            Debug.LogWarning("NetworkManager is not available or not a client, profile won't be auto-synced");
+        }
+    }
+
+    // Add this public method to allow requesting profile data refresh
+    public void RequestProfileRefresh()
+    {
+        if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsClient)
+        {
+            // If we have a saved profile, sync it
+            if (!string.IsNullOrEmpty(selectedProfileId))
+            {
+                SyncProfileWithNetwork();
+            }
+            else
+            {
+                Debug.Log("No profile selected to refresh");
             }
         }
     }
@@ -767,16 +812,44 @@ public class DLCManager : NetworkBehaviour
         {
             gameUIDLCIntegration.OnProfileSelected(selectedProfileId);
         }
+        else
+        {
+            Debug.LogWarning("gameUIDLCIntegration is null, trying to find it");
+            gameUIDLCIntegration = FindObjectOfType<GameUIDLCIntegration>();
+            
+            if (gameUIDLCIntegration != null)
+            {
+                gameUIDLCIntegration.OnProfileSelected(selectedProfileId);
+            }
+            else
+            {
+                Debug.LogError("Could not find GameUIDLCIntegration in the scene");
+            }
+        }
         
         // Network sync - use ServerRpc to tell server about our profile selection
         if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsClient)
         {
-            // Use ServerRpc instead of directly writing to network variable
-            UpdateProfileServerRpc(selectedProfileId, PlayerPrefs.GetString("PlayerName", "Player" + NetworkManager.Singleton.LocalClientId));
+            try
+            {
+                // Get player name, provide fallback if not found
+                string playerName = PlayerPrefs.GetString("PlayerName", "Player" + NetworkManager.Singleton.LocalClientId);
+                Debug.Log($"Sending profile update to server: {selectedProfileId}, Name={playerName}");
+                
+                // Use ServerRpc instead of directly writing to network variable
+                UpdateProfileServerRpc(selectedProfileId, playerName);
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"Error updating profile on server: {e.Message}");
+            }
+        }
+        else
+        {
+            Debug.LogWarning("NetworkManager is not available or not a client, profile won't be synced");
         }
     }
 
-    // Add these methods to DLCManager.cs
     [ServerRpc(RequireOwnership = false)]
     private void UpdateProfileServerRpc(string profileId, string playerName, ServerRpcParams rpcParams = default)
     {
@@ -785,15 +858,31 @@ public class DLCManager : NetworkBehaviour
         
         Debug.Log($"Server received profile update from client {clientId}: Profile={profileId}, Name={playerName}");
         
+        // Safety check for NetworkManager
+        if (NetworkManager.Singleton == null)
+        {
+            Debug.LogError("NetworkManager.Singleton is null in UpdateProfileServerRpc");
+            return;
+        }
+        
         // Find the client's NetworkObject
         if (NetworkManager.Singleton.ConnectedClients.TryGetValue(clientId, out NetworkClient networkClient))
         {
+            // Safety check for PlayerObject
+            if (networkClient.PlayerObject == null)
+            {
+                Debug.LogError($"PlayerObject is null for client {clientId}");
+                
+                // Use a fallback approach - broadcast the update to all clients anyway
+                NotifyProfileUpdateClientRpc(profileId, playerName, clientId);
+                return;
+            }
+            
             // Find the player's DLCManager object
             DLCManager clientDLCManager = networkClient.PlayerObject.GetComponent<DLCManager>();
             if (clientDLCManager != null)
             {
                 // Update the NetworkVariable on the server for this specific client's object
-                // This works because we're now on the server, which can modify any NetworkVariable
                 clientDLCManager.playerProfileData.Value = new ProfilePictureNetworkData
                 {
                     ProfileId = profileId,
@@ -803,6 +892,18 @@ public class DLCManager : NetworkBehaviour
                 // Broadcast to all clients
                 NotifyProfileUpdateClientRpc(profileId, playerName, clientId);
             }
+            else
+            {
+                Debug.LogError($"DLCManager component not found on PlayerObject for client {clientId}");
+                // Use fallback approach
+                NotifyProfileUpdateClientRpc(profileId, playerName, clientId);
+            }
+        }
+        else
+        {
+            Debug.LogError($"Could not find connected client with ID {clientId}");
+            // Use fallback approach
+            NotifyProfileUpdateClientRpc(profileId, playerName, clientId);
         }
     }
 

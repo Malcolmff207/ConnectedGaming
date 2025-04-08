@@ -47,12 +47,22 @@ public class GameUIDLCIntegration : MonoBehaviour
         if (dlcManager == null)
         {
             Debug.LogWarning("DLCManager not found in scene. DLC features may not work properly.");
+            dlcManager = FindObjectOfType<DLCManager>();
+            if (dlcManager == null)
+                Debug.LogError("Could not find DLCManager even with FindObjectOfType");
         }
+        
+        // Verify UI components are properly assigned
+        VerifyUIComponents();
         
         // Set up button listeners
         if (openStoreButton != null)
         {
             openStoreButton.onClick.AddListener(OpenDLCStore);
+        }
+        else
+        {
+            Debug.LogWarning("Open Store Button not assigned");
         }
         
         // Initialize with a generic name - don't use network roles yet
@@ -76,6 +86,10 @@ public class GameUIDLCIntegration : MonoBehaviour
                 OnClientConnected(NetworkManager.Singleton.LocalClientId);
             }
         }
+        else
+        {
+            Debug.LogWarning("NetworkManager.Singleton is null in Start. Network features may not work.");
+        }
     }
     
     private void OnDestroy()
@@ -92,6 +106,49 @@ public class GameUIDLCIntegration : MonoBehaviour
             NetworkManager.Singleton.OnClientConnectedCallback -= OnClientConnected;
             NetworkManager.Singleton.OnClientDisconnectCallback -= OnClientDisconnect;
         }
+    }
+    
+    // Verify UI components are properly assigned
+    private void VerifyUIComponents()
+    {
+        // Check and find image components if they're null
+        if (playerProfileImage == null)
+        {
+            playerProfileImage = GameObject.Find("PlayerProfileImage")?.GetComponent<Image>();
+            if (playerProfileImage == null)
+                Debug.LogError("Player Profile Image not found in scene");
+        }
+        
+        if (hostProfileImage == null)
+        {
+            hostProfileImage = GameObject.Find("Player1ProfileImage")?.GetComponent<Image>();
+            if (hostProfileImage == null)
+                Debug.LogError("Host Profile Image (Player1ProfileImage) not found in scene");
+        }
+        
+        if (clientProfileImage == null)
+        {
+            clientProfileImage = GameObject.Find("Player2ProfileImage")?.GetComponent<Image>();
+            if (clientProfileImage == null)
+                Debug.LogError("Client Profile Image (Player2ProfileImage) not found in scene");
+        }
+        
+        // Check and find text components if they're null
+        if (hostNameText == null)
+        {
+            hostNameText = GameObject.Find("HostName")?.GetComponent<TextMeshProUGUI>();
+            if (hostNameText == null)
+                Debug.LogError("Host Name Text not found in scene");
+        }
+        
+        if (clientNameText == null)
+        {
+            clientNameText = GameObject.Find("ClientName")?.GetComponent<TextMeshProUGUI>();
+            if (clientNameText == null)
+                Debug.LogError("Client Name Text not found in scene");
+        }
+        
+        LogStatus("UI Components verification completed");
     }
     
     private void LoadInitialProfileImage()
@@ -114,7 +171,9 @@ public class GameUIDLCIntegration : MonoBehaviour
     // Network event handlers
     private void OnClientConnected(ulong clientId)
     {
-        // Only update UI for the local player's first connection
+        LogStatus($"Client connected: {clientId}, Local client: {NetworkManager.Singleton.LocalClientId}");
+        
+        // Update UI for the local player's first connection
         if (!hasConnected && clientId == NetworkManager.Singleton.LocalClientId)
         {
             hasConnected = true;
@@ -135,6 +194,16 @@ public class GameUIDLCIntegration : MonoBehaviour
             }
             
             LogStatus("Network connection established, updated player UI");
+            
+            // Request a refresh of profile data from all connected clients
+            RequestAllProfileRefreshes();
+        }
+        
+        // If another player joins and we're already connected, show our profile to them
+        if (hasConnected && clientId != NetworkManager.Singleton.LocalClientId)
+        {
+            LogStatus($"Another player joined (ID: {clientId}), sharing our profile with them");
+            ShareProfileWithNewPlayer();
         }
     }
     
@@ -152,6 +221,92 @@ public class GameUIDLCIntegration : MonoBehaviour
             }
             
             LogStatus("Disconnected from network");
+        }
+    }
+    
+    // New method to request all players to refresh their profile data
+    private void RequestAllProfileRefreshes()
+    {
+        // Small delay to allow network objects to spawn properly
+        StartCoroutine(DelayedProfileRefresh(0.5f));
+    }
+
+    // New coroutine to add a delay before refreshing profiles
+    private IEnumerator DelayedProfileRefresh(float delay)
+    {
+        yield return new WaitForSeconds(delay);
+        
+        // First make sure our own profile is synced
+        if (dlcManager != null)
+        {
+            dlcManager.SyncProfileWithNetwork();
+        }
+        else
+        {
+            // Try to find DLCManager if not already assigned
+            dlcManager = FindObjectOfType<DLCManager>();
+            if (dlcManager != null)
+            {
+                dlcManager.SyncProfileWithNetwork();
+            }
+            else
+            {
+                LogStatus("Cannot find DLCManager to request profile refresh");
+            }
+        }
+        
+        // Now if we're the host/server, trigger a network-wide refresh
+        if (NetworkManager.Singleton.IsHost || NetworkManager.Singleton.IsServer)
+        {
+            LogStatus("Requesting all clients to refresh their profiles");
+            TriggerNetworkWideProfileRefreshServerRpc();
+        }
+    }
+
+    // New method to share our profile with a newly joined player
+    private void ShareProfileWithNewPlayer()
+    {
+        // If we have a profile ID and DLC manager, sync it
+        if (!string.IsNullOrEmpty(localProfileId) && dlcManager != null)
+        {
+            dlcManager.SyncProfileWithNetwork();
+        }
+        else if (dlcManager == null)
+        {
+            LogStatus("Cannot share profile - DLCManager not found");
+        }
+    }
+
+    // Add these RPC methods for network-wide profile refresh
+    [ServerRpc(RequireOwnership = false)]
+    private void TriggerNetworkWideProfileRefreshServerRpc()
+    {
+        // Only the server can do this
+        if (NetworkManager.Singleton.IsServer || NetworkManager.Singleton.IsHost)
+        {
+            TriggerProfileRefreshClientRpc();
+        }
+    }
+
+    [ClientRpc]
+    private void TriggerProfileRefreshClientRpc()
+    {
+        LogStatus("Received profile refresh request from server");
+        
+        // Find DLC manager if needed
+        if (dlcManager == null)
+        {
+            dlcManager = FindObjectOfType<DLCManager>();
+        }
+        
+        // Request refresh
+        if (dlcManager != null)
+        {
+            dlcManager.RequestProfileRefresh();
+        }
+        else
+        {
+            LogStatus("Cannot refresh profile - DLCManager not found");
         }
     }
     
@@ -201,13 +356,27 @@ public class GameUIDLCIntegration : MonoBehaviour
     // Called by DLCManager when a profile is selected
     public void OnProfileSelected(string profileId)
     {
+        // Log that we received the profile selection
+        LogStatus($"Profile selected: {profileId}");
+        
+        // Make sure profileId is not null or empty
+        if (string.IsNullOrEmpty(profileId))
+        {
+            LogStatus("Received empty profile ID");
+            return;
+        }
+        
         // Update local data
         localProfileId = profileId;
         
-        // Update local UI
+        // Update local UI with a safety check
         if (playerProfileImage != null)
         {
             StartCoroutine(LoadProfilePictureForImage(profileId, playerProfileImage));
+        }
+        else
+        {
+            LogStatus("playerProfileImage is null, can't update local profile");
         }
         
         // If in multiplayer, sync with network
@@ -233,15 +402,34 @@ public class GameUIDLCIntegration : MonoBehaviour
                     clientNameText.text = localPlayerName;
                 }
             }
+            else
+            {
+                LogStatus($"Could not update network profile UI: isHost={isHost}, hostImage={hostProfileImage != null}, clientImage={clientProfileImage != null}");
+            }
+        }
+        else
+        {
+            LogStatus("NetworkManager not available, can't sync profile with network");
         }
     }
     
     // Called when another player changes their profile
     public void UpdateOtherPlayerProfile(string profileId, string playerName)
     {
+        LogStatus($"UpdateOtherPlayerProfile called with profileId={profileId}, playerName={playerName}");
+        
         if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsConnectedClient)
+        {
+            LogStatus("NetworkManager not available, can't update other player's profile");
             return;
-            
+        }
+        
+        if (string.IsNullOrEmpty(profileId))
+        {
+            LogStatus("Received empty profile ID for other player");
+            return;
+        }
+                
         bool isLocalPlayerHost = NetworkManager.Singleton.IsHost || NetworkManager.Singleton.IsServer;
         
         // Store remote profile data
@@ -257,7 +445,7 @@ public class GameUIDLCIntegration : MonoBehaviour
             StartCoroutine(LoadProfilePictureForImage(profileId, clientProfileImage));
             if (clientNameText != null)
                 clientNameText.text = playerName;
-                
+                    
             LogStatus($"Host updated client profile to {profileId}");
         }
         else if (!isLocalPlayerHost && hostProfileImage != null)
@@ -265,8 +453,12 @@ public class GameUIDLCIntegration : MonoBehaviour
             StartCoroutine(LoadProfilePictureForImage(profileId, hostProfileImage));
             if (hostNameText != null)
                 hostNameText.text = playerName;
-                
+                    
             LogStatus($"Client updated host profile to {profileId}");
+        }
+        else
+        {
+            LogStatus($"Could not update other player profile UI: isHost={isLocalPlayerHost}, hostImage={hostProfileImage != null}, clientImage={clientProfileImage != null}");
         }
     }
     
@@ -275,7 +467,7 @@ public class GameUIDLCIntegration : MonoBehaviour
     {
         if (string.IsNullOrEmpty(profileId) || targetImage == null)
             yield break;
-            
+                
         LogStatus($"Loading profile picture: {profileId}");
         
         // Try to load from saved file first
@@ -284,43 +476,74 @@ public class GameUIDLCIntegration : MonoBehaviour
         if (System.IO.File.Exists(filePath))
         {
             LogStatus($"Found local file for {profileId}");
+            byte[] data = null;
+            bool fileReadSuccess = false;
+            
+            // Try to read the file
             try
             {
-                // Load file data
-                byte[] data = System.IO.File.ReadAllBytes(filePath);
-                
-                // Create and load texture
-                Texture2D texture = new Texture2D(2, 2);
-                if (texture.LoadImage(data))
-                {
-                    // Create sprite from texture
-                    Sprite sprite = Sprite.Create(
-                        texture, 
-                        new Rect(0, 0, texture.width, texture.height), 
-                        new Vector2(0.5f, 0.5f)
-                    );
-                    
-                    // Apply sprite to image
-                    targetImage.sprite = sprite;
-                    LogStatus($"Applied profile image from file: {profileId}");
-                }
-                else
-                {
-                    LogStatus($"Failed to load image data for {profileId}");
-                    yield return TryLoadFromDLCManager(profileId, targetImage);
-                }
+                data = System.IO.File.ReadAllBytes(filePath);
+                fileReadSuccess = (data != null && data.Length > 0);
             }
             catch (System.Exception e)
             {
-                LogStatus($"Error loading profile image from file: {e.Message}");
-                yield return TryLoadFromDLCManager(profileId, targetImage);
+                LogStatus($"Error reading file: {e.Message}");
+                fileReadSuccess = false;
             }
+            
+            // If we successfully read the file, try to create a texture
+            if (fileReadSuccess)
+            {
+                Texture2D texture = new Texture2D(2, 2);
+                bool textureLoadSuccess = false;
+                
+                try
+                {
+                    textureLoadSuccess = texture.LoadImage(data);
+                }
+                catch (System.Exception e)
+                {
+                    LogStatus($"Error loading image data: {e.Message}");
+                    textureLoadSuccess = false;
+                }
+                
+                // If texture loaded successfully, create sprite
+                if (textureLoadSuccess && texture != null)
+                {
+                    Sprite sprite = null;
+                    bool spriteCreateSuccess = false;
+                    
+                    try
+                    {
+                        sprite = Sprite.Create(
+                            texture, 
+                            new Rect(0, 0, texture.width, texture.height), 
+                            new Vector2(0.5f, 0.5f)
+                        );
+                        spriteCreateSuccess = (sprite != null);
+                    }
+                    catch (System.Exception e)
+                    {
+                        LogStatus($"Error creating sprite: {e.Message}");
+                        spriteCreateSuccess = false;
+                    }
+                    
+                    // If sprite was created successfully, apply to image
+                    if (spriteCreateSuccess)
+                    {
+                        targetImage.sprite = sprite;
+                        LogStatus($"Applied profile image from file: {profileId}");
+                        yield break; // Success! Exit here
+                    }
+                }
+            }
+            
+            // If we got here, something failed - try loading from DLCManager
+            LogStatus($"Failed to load image from file, trying DLCManager");
         }
-        else
-        {
-            LogStatus($"No local file for {profileId}, trying DLCManager");
-            yield return TryLoadFromDLCManager(profileId, targetImage);
-        }
+        
+        // Try loading from DLCManager
+        yield return TryLoadFromDLCManager(profileId, targetImage);
     }
 
     // This helper method tries to load from DLCManager
@@ -337,7 +560,7 @@ public class GameUIDLCIntegration : MonoBehaviour
             }
         }
         
-        // Try to load the profile directly from Firebase using DLCManager's methods
+        // Try to find matching profile
         ProfilePicture matchingProfile = null;
         
         // Find a profile with the given ID
@@ -372,55 +595,70 @@ public class GameUIDLCIntegration : MonoBehaviour
             if (loadMethod != null)
             {
                 LogStatus($"Starting image load for {matchingProfile.ImageUrl}");
-                yield return (IEnumerator)loadMethod.Invoke(dlcManager, new object[] { matchingProfile.ImageUrl, targetImage });
-                LogStatus($"Completed image load for {matchingProfile.Name}");
+                
+                // Call the method from DLCManager using reflection
+                var loadCoroutine = (IEnumerator)loadMethod.Invoke(
+                    dlcManager, 
+                    new object[] { matchingProfile.ImageUrl, targetImage }
+                );
+                
+                // Execute the coroutine
+                if (loadCoroutine != null)
+                {
+                    while (loadCoroutine.MoveNext())
+                    {
+                        yield return loadCoroutine.Current;
+                    }
+                    
+                    LogStatus($"Completed image load for {matchingProfile.Name}");
+                    yield break;
+                }
             }
             else
             {
-                // If we can't access the DLCManager's method, try a fallback
+                // If we can't access the DLCManager's method, use fallback
                 LogStatus("Using fallback image loading");
-                
-                // This switches automatically to Bishop if profile not found
-                switch (profileId.ToLower().Replace("profile_", ""))
-                {
-                    case "knight":
-                        LoadPlaceholderImage("Knight", targetImage);
-                        break;
-                    case "queen":
-                        LoadPlaceholderImage("Queen", targetImage);
-                        break;
-                    case "king":
-                        LoadPlaceholderImage("King", targetImage);
-                        break;
-                    default:
-                        LoadPlaceholderImage("Bishop", targetImage);
-                        break;
-                }
+                LoadFallbackImage(profileId, targetImage);
             }
         }
         else
         {
             LogStatus($"No matching profile found for {profileId}, using fallback");
-            
-            // Fallback - try direct path based on ID
-            string imageName = profileId.Replace("profile_", "");
-            string imagePath = "Chess/" + char.ToUpper(imageName[0]) + imageName.Substring(1) + ".jpg";
-            
-            LogStatus($"Trying fallback path: {imagePath}");
-            
-            // Use DLCManager's method
-            var loadMethod = dlcManager.GetType().GetMethod("LoadImagePreview", 
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                
-            if (loadMethod != null)
+            LoadFallbackImage(profileId, targetImage);
+        }
+    }
+
+    // Helper to load a fallback image based on profile ID
+    private void LoadFallbackImage(string profileId, Image targetImage)
+    {
+        string pieceName = "";
+        
+        // Extract piece name from profile ID
+        if (profileId.Contains("_"))
+        {
+            pieceName = profileId.Split('_')[1];
+            // Capitalize first letter
+            if (!string.IsNullOrEmpty(pieceName) && pieceName.Length > 0)
             {
-                yield return (IEnumerator)loadMethod.Invoke(dlcManager, new object[] { imagePath, targetImage });
+                pieceName = char.ToUpper(pieceName[0]) + (pieceName.Length > 1 ? pieceName.Substring(1) : "");
             }
-            else
-            {
-                // Placeholder fallback based on ID
-                LoadPlaceholderImage(imageName, targetImage);
-            }
+        }
+        
+        // Fallback based on ID
+        switch (profileId.ToLower().Replace("profile_", ""))
+        {
+            case "knight":
+                LoadPlaceholderImage("Knight", targetImage);
+                break;
+            case "queen":
+                LoadPlaceholderImage("Queen", targetImage);
+                break;
+            case "king":
+                LoadPlaceholderImage("King", targetImage);
+                break;
+            default:
+                LoadPlaceholderImage("Bishop", targetImage);
+                break;
         }
     }
 
