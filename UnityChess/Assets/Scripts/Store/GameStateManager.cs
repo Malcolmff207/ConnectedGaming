@@ -7,10 +7,10 @@ using Unity.Netcode;
 using Firebase;
 using Firebase.Database;
 using Firebase.Extensions;
-using TMPro;
 
 /// <summary>
 /// Manages saving and restoring game states to/from Firebase
+/// Simplified version that doesn't require UI interaction
 /// </summary>
 public class GameStateManager : MonoBehaviour
 {
@@ -21,17 +21,19 @@ public class GameStateManager : MonoBehaviour
     private DatabaseReference databaseReference;
     private bool firebaseInitialized = false;
     
-    // UI elements
-    [Header("UI References")]
-    [SerializeField] private GameObject saveGamePanel;
-    [SerializeField] private GameObject loadGamePanel;
-    [SerializeField] private Transform savedGamesContainer;
-    [SerializeField] private GameObject savedGameItemPrefab;
-    [SerializeField] private TMP_InputField saveGameNameInput;
-    [SerializeField] private TextMeshProUGUI statusText;
+    // Auto-save settings
+    [SerializeField] private bool enableAutoSave = true;
+    [SerializeField] private float autoSaveInterval = 60f; // Save every minute by default
+    private string lastSavedState = "";
     
     // Cached saved games
     private List<SavedGameInfo> savedGames = new List<SavedGameInfo>();
+    
+    // Latest saved/loaded game info for analytics
+    public string LastSaveId { get; private set; }
+    public string LastSaveName { get; private set; }
+    public string LastLoadId { get; private set; }
+    public string LastLoadName { get; private set; }
     
     [Serializable]
     public class SavedGameInfo
@@ -54,6 +56,7 @@ public class GameStateManager : MonoBehaviour
             return;
         }
         Instance = this;
+        DontDestroyOnLoad(gameObject);
     }
     
     private void Start()
@@ -61,12 +64,21 @@ public class GameStateManager : MonoBehaviour
         // Initialize Firebase
         InitializeFirebase();
         
-        // Hide UI panels
-        if (saveGamePanel != null)
-            saveGamePanel.SetActive(false);
-            
-        if (loadGamePanel != null)
-            loadGamePanel.SetActive(false);
+        // Start the auto-save coroutine if enabled
+        if (enableAutoSave)
+        {
+            StartCoroutine(AutoSaveCoroutine());
+        }
+        
+        // Subscribe to game events - safely
+        try
+        {
+            GameManager.GameEndedEvent += OnGameEnded;
+        }
+        catch (Exception)
+        {
+            Debug.LogWarning("Could not subscribe to GameEndedEvent");
+        }
     }
     
     private void OnDestroy()
@@ -75,14 +87,24 @@ public class GameStateManager : MonoBehaviour
         {
             Instance = null;
         }
+        
+        // Unsubscribe from events - safely
+        try
+        {
+            GameManager.GameEndedEvent -= OnGameEnded;
+        }
+        catch (Exception)
+        {
+            Debug.LogWarning("Could not unsubscribe from GameEndedEvent");
+        }
     }
     
-    private async void InitializeFirebase()
+    private void InitializeFirebase()
     {
         try
         {
             // Check dependencies
-            await FirebaseApp.CheckAndFixDependenciesAsync().ContinueWithOnMainThread(task => 
+            FirebaseApp.CheckAndFixDependenciesAsync().ContinueWithOnMainThread(task => 
             {
                 if (task.Exception != null)
                 {
@@ -90,11 +112,15 @@ public class GameStateManager : MonoBehaviour
                     return;
                 }
                 
-                // Initialize Firebase Database
-                databaseReference = FirebaseDatabase.DefaultInstance.RootReference;
+                // Initialize Firebase Database with explicit URL
+                FirebaseDatabase database = FirebaseDatabase.GetInstance("https://connectedgaming-18bcb-default-rtdb.europe-west1.firebasedatabase.app/");
+                databaseReference = database.RootReference;
                 
                 firebaseInitialized = true;
                 Debug.Log("Firebase Database initialized successfully!");
+                
+                // Load saved games list in the background
+                StartCoroutine(LoadSavedGamesCoroutine());
             });
         }
         catch (Exception e)
@@ -103,165 +129,168 @@ public class GameStateManager : MonoBehaviour
         }
     }
     
-    // Save the current game state
-    public void SaveCurrentGame()
+    private IEnumerator AutoSaveCoroutine()
     {
-        if (saveGamePanel != null)
+        yield return new WaitForSeconds(10f); // Initial delay to let game initialize
+        
+        while (true)
         {
-            saveGamePanel.SetActive(true);
-        }
-    }
-    
-    // Open the load game panel and refresh the list of saved games
-    public void OpenLoadGamePanel()
-    {
-        if (loadGamePanel != null)
-        {
-            loadGamePanel.SetActive(true);
-            RefreshSavedGamesList();
-        }
-    }
-    
-    // Close UI panels
-    public void CloseAllPanels()
-    {
-        if (saveGamePanel != null)
-            saveGamePanel.SetActive(false);
+            // Only save if there's an active game
+            if (GameManager.Instance != null && GameManager.Instance.CurrentBoard != null)
+            {
+                // Get current game state
+                string currentState = GameManager.Instance.SerializeGame();
+                
+                // Only save if state has changed
+                if (currentState != lastSavedState && !string.IsNullOrEmpty(currentState))
+                {
+                    string saveName = "AutoSave_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                    SaveGameToFirebase(saveName, currentState);
+                    lastSavedState = currentState;
+                }
+            }
             
-        if (loadGamePanel != null)
-            loadGamePanel.SetActive(false);
+            yield return new WaitForSeconds(autoSaveInterval);
+        }
     }
     
-    // Save the current game to Firebase
-    public void SaveGameToFirebase()
+    // Called when a game ends
+    private void OnGameEnded()
+    {
+        // Save the final game state
+        if (GameManager.Instance != null)
+        {
+            string finalState = GameManager.Instance.SerializeGame();
+            string saveName = "Completed_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            SaveGameToFirebase(saveName, finalState);
+        }
+    }
+    
+    // Public method to manually save the current game
+    public void SaveCurrentGame(string saveName = "")
+    {
+        if (string.IsNullOrEmpty(saveName))
+        {
+            saveName = "Manual_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        }
+        
+        if (GameManager.Instance != null)
+        {
+            string gameState = GameManager.Instance.SerializeGame();
+            SaveGameToFirebase(saveName, gameState);
+        }
+    }
+    
+    // Internal method to save game to Firebase
+    private void SaveGameToFirebase(string saveName, string fenString)
     {
         if (!firebaseInitialized || databaseReference == null)
         {
-            ShowStatus("Firebase not initialized. Try again later.");
+            Debug.LogWarning("Firebase not initialized. Can't save game.");
             return;
         }
         
-        // Get save game name from input field
-        string saveName = saveGameNameInput != null ? saveGameNameInput.text.Trim() : "";
-        
-        if (string.IsNullOrEmpty(saveName))
-        {
-            ShowStatus("Please enter a name for your saved game.");
-            return;
-        }
-        
-        StartCoroutine(SaveGameCoroutine(saveName));
+        StartCoroutine(SaveGameCoroutine(saveName, fenString));
     }
     
-    private IEnumerator SaveGameCoroutine(string saveName)
+    private IEnumerator SaveGameCoroutine(string saveName, string fenString)
     {
-        ShowStatus("Saving game...");
+        Debug.Log($"Saving game: {saveName}...");
         
-        // Variables needed for the save operation
-        string fenString = "";
+        // Generate a unique ID
+        string saveId = Guid.NewGuid().ToString();
+        
+        // Store for analytics reference
+        LastSaveId = saveId;
+        LastSaveName = saveName;
+        
+        // Save to PlayerPrefs for analytics tracking
+        PlayerPrefs.SetString("LastSaveId", saveId);
+        PlayerPrefs.SetString("LastSaveName", saveName);
+        
+        // Get move count
         int moveCount = 0;
-        string saveId = "";
-        Dictionary<string, object> saveData = null;
-        string userId = "";
-        
-        // Collect all data needed before the try block
-        try
+        if (GameManager.Instance != null && GameManager.Instance.HalfMoveTimeline != null)
         {
-            // Get the current game state
-            fenString = GameManager.Instance.SerializeGame();
             moveCount = GameManager.Instance.HalfMoveTimeline.Count;
-            
-            // Generate a unique ID for this saved game
-            saveId = Guid.NewGuid().ToString();
-            
-            // Create the saved game data
-            saveData = new Dictionary<string, object>
-            {
-                { "id", saveId },
-                { "name", saveName },
-                { "date", DateTime.UtcNow.ToString("o") },
-                { "fen", fenString },
-                { "moveCount", moveCount },
-                { "playerWhite", PlayerPrefs.GetString("PlayerName", "Player") },
-                { "playerBlack", "Opponent" }
-            };
-            
-            // Get the current user ID (or generate one if not available)
-            userId = NetworkManager.Singleton != null 
-                ? NetworkManager.Singleton.LocalClientId.ToString() 
-                : SystemInfo.deviceUniqueIdentifier;
         }
-        catch (Exception e)
+        
+        // Create save data
+        Dictionary<string, object> saveData = new Dictionary<string, object>
         {
-            Debug.LogError($"Error preparing save data: {e.Message}");
-            ShowStatus("Failed to prepare save data: " + e.Message);
-            yield break;
+            { "id", saveId },
+            { "name", saveName },
+            { "date", DateTime.UtcNow.ToString("o") },
+            { "fen", fenString },
+            { "moveCount", moveCount },
+            { "playerWhite", PlayerPrefs.GetString("PlayerName", "Player") },
+            { "playerBlack", "Opponent" }
+        };
+        
+        // Get user ID
+        string userId = GetCurrentUserId();
+        
+        // Save to Firebase
+        var saveTask = databaseReference.Child("savedGames").Child(userId).Child(saveId).SetValueAsync(saveData);
+        
+        while (!saveTask.IsCompleted)
+        {
+            yield return null;
         }
         
-        // Now save to Firebase outside the try block
-        var saveTask = databaseReference.Child("savedGames").Child(userId).Child(saveId).SetValueAsync(saveData);
-        yield return new WaitUntil(() => saveTask.IsCompleted);
-        
-        // Check if the save was successful
         if (saveTask.Exception != null)
         {
             Debug.LogError($"Failed to save game: {saveTask.Exception}");
-            ShowStatus("Failed to save game. Please try again.");
             yield break;
         }
         
-        ShowStatus("Game saved successfully!");
+        Debug.Log($"Game saved successfully: {saveName}");
         
-        // Close the save panel after a short delay
-        yield return new WaitForSeconds(1.5f);
+        // Update saved games list
+        SavedGameInfo savedGame = new SavedGameInfo
+        {
+            Id = saveId,
+            Name = saveName,
+            Date = DateTime.UtcNow.ToString("o"),
+            FEN = fenString,
+            MoveCount = moveCount,
+            PlayerWhite = PlayerPrefs.GetString("PlayerName", "Player"),
+            PlayerBlack = "Opponent"
+        };
         
-        if (saveGamePanel != null)
-            saveGamePanel.SetActive(false);
-            
-        // Clear the input field
-        if (saveGameNameInput != null)
-            saveGameNameInput.text = "";
+        savedGames.Add(savedGame);
     }
     
-    // Refresh the list of saved games from Firebase
-    public void RefreshSavedGamesList()
+    // Public method to load a saved game by ID
+    public void LoadSavedGame(string saveId)
     {
         if (!firebaseInitialized || databaseReference == null)
         {
-            ShowStatus("Firebase not initialized. Try again later.");
+            Debug.LogWarning("Firebase not initialized. Can't load game.");
             return;
         }
         
-        StartCoroutine(RefreshSavedGamesCoroutine());
+        StartCoroutine(LoadSavedGameCoroutine(saveId));
     }
     
-    private IEnumerator RefreshSavedGamesCoroutine()
+    private IEnumerator LoadSavedGameCoroutine(string saveId)
     {
-        ShowStatus("Loading saved games...");
+        Debug.Log($"Loading game with ID: {saveId}...");
         
-        // Clear existing saved game items before the try block
-        foreach (Transform child in savedGamesContainer)
+        // Get user ID
+        string userId = GetCurrentUserId();
+        
+        // Query Firebase for the saved game
+        var queryTask = databaseReference.Child("savedGames").Child(userId).Child(saveId).GetValueAsync();
+        
+        while (!queryTask.IsCompleted)
         {
-            Destroy(child.gameObject);
+            yield return null;
         }
         
-        // Clear cached list
-        savedGames.Clear();
-        
-        // Get the current user ID
-        string userId = NetworkManager.Singleton != null 
-            ? NetworkManager.Singleton.LocalClientId.ToString() 
-            : SystemInfo.deviceUniqueIdentifier;
-        
-        // Query saved games for this user
-        var queryTask = databaseReference.Child("savedGames").Child(userId).GetValueAsync();
-        yield return new WaitUntil(() => queryTask.IsCompleted);
-        
-        // Handle query results
         if (queryTask.Exception != null)
         {
-            Debug.LogError($"Failed to query saved games: {queryTask.Exception}");
-            ShowStatus("Failed to load saved games. Please try again.");
+            Debug.LogError($"Failed to query saved game: {queryTask.Exception}");
             yield break;
         }
         
@@ -269,15 +298,104 @@ public class GameStateManager : MonoBehaviour
         
         if (!snapshot.Exists)
         {
-            ShowStatus("No saved games found.");
+            Debug.LogWarning($"Saved game with ID {saveId} not found.");
+            yield break;
+        }
+        
+        // Extract game data
+        string fenString = snapshot.Child("fen").Value?.ToString();
+        string saveName = snapshot.Child("name").Value?.ToString();
+        
+        if (string.IsNullOrEmpty(fenString))
+        {
+            Debug.LogError("Invalid saved game data: missing FEN string.");
+            yield break;
+        }
+        
+        // Store for analytics reference
+        LastLoadId = saveId;
+        LastLoadName = saveName;
+        
+        // Save to PlayerPrefs for analytics tracking
+        PlayerPrefs.SetString("LastLoadId", saveId);
+        PlayerPrefs.SetString("LastLoadName", saveName);
+        
+        // Load the game
+        LoadGame(fenString);
+        
+        Debug.Log($"Game '{saveName}' loaded successfully!");
+    }
+    
+    // Internal method to load a game from FEN string
+    public void LoadGame(string fenString)
+    {
+        if (GameManager.Instance != null)
+        {
+            // Check if we're in a networked game
+            if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsConnectedClient)
+            {
+                // In a networked game, the host needs to load the game for all players
+                if (NetworkManager.Singleton.IsHost || NetworkManager.Singleton.IsServer)
+                {
+                    LoadGameForAllClients(fenString);
+                }
+                else
+                {
+                    // Clients should request the host to load the game
+                    RequestLoadGame(fenString);
+                }
+            }
+            else
+            {
+                // In a local game, just load it directly
+                GameManager.Instance.LoadGame(fenString);
+            }
+        }
+    }
+    
+    // Public method to get the list of saved games
+    public List<SavedGameInfo> GetSavedGames()
+    {
+        return new List<SavedGameInfo>(savedGames);
+    }
+    
+    // Load the list of saved games from Firebase
+    private IEnumerator LoadSavedGamesCoroutine()
+    {
+        Debug.Log("Loading saved games list...");
+        
+        // Clear the list
+        savedGames.Clear();
+        
+        // Get user ID
+        string userId = GetCurrentUserId();
+        
+        // Query saved games
+        var queryTask = databaseReference.Child("savedGames").Child(userId).GetValueAsync();
+        
+        while (!queryTask.IsCompleted)
+        {
+            yield return null;
+        }
+        
+        if (queryTask.Exception != null)
+        {
+            Debug.LogError($"Failed to query saved games: {queryTask.Exception}");
+            yield break;
+        }
+        
+        DataSnapshot snapshot = queryTask.Result;
+        
+        if (!snapshot.Exists)
+        {
+            Debug.Log("No saved games found.");
             yield break;
         }
         
         // Process each saved game
-        try
+        foreach (DataSnapshot childSnapshot in snapshot.Children)
         {
-            // Process each saved game
-            foreach (DataSnapshot childSnapshot in snapshot.Children)
+            try
             {
                 SavedGameInfo savedGame = new SavedGameInfo
                 {
@@ -290,101 +408,15 @@ public class GameStateManager : MonoBehaviour
                     MoveCount = Convert.ToInt32(childSnapshot.Child("moveCount").Value)
                 };
                 
-                // Add to cached list
                 savedGames.Add(savedGame);
-                
-                // Create UI element
-                GameObject itemGO = Instantiate(savedGameItemPrefab, savedGamesContainer);
-                SavedGameItemUI itemUI = itemGO.GetComponent<SavedGameItemUI>();
-                
-                if (itemUI != null)
-                {
-                    // Parse date for display
-                    string displayDate = "Unknown date";
-                    if (DateTime.TryParse(savedGame.Date, out DateTime date))
-                    {
-                        displayDate = date.ToString("g"); // Short date and time pattern
-                    }
-                    
-                    // Setup the UI item
-                    itemUI.Setup(
-                        savedGame.Id,
-                        savedGame.Name,
-                        displayDate,
-                        $"Moves: {savedGame.MoveCount}",
-                        savedGame.PlayerWhite + " vs " + savedGame.PlayerBlack
-                    );
-                    
-                    // Add click handler
-                    itemUI.OnLoadClicked += LoadSavedGame;
-                    itemUI.OnDeleteClicked += DeleteSavedGame;
-                }
             }
-            
-            ShowStatus($"Found {savedGames.Count} saved games.");
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"Error processing saved games: {e.Message}");
-            ShowStatus("Error processing saved games: " + e.Message);
-        }
-    }
-    
-    // Load a saved game by ID
-    public void LoadSavedGame(string saveId)
-    {
-        SavedGameInfo savedGame = savedGames.Find(g => g.Id == saveId);
-        
-        if (savedGame == null || string.IsNullOrEmpty(savedGame.FEN))
-        {
-            ShowStatus("Error: Could not find saved game data.");
-            return;
-        }
-        
-        StartCoroutine(LoadGameCoroutine(savedGame));
-    }
-    
-    private IEnumerator LoadGameCoroutine(SavedGameInfo savedGame)
-    {
-        ShowStatus($"Loading game: {savedGame.Name}...");
-        
-        // Handle loading the game
-        try
-        {
-            // Check if we're in a networked game
-            if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsConnectedClient)
+            catch (Exception e)
             {
-                // In a networked game, the host needs to load the game for all players
-                if (NetworkManager.Singleton.IsHost || NetworkManager.Singleton.IsServer)
-                {
-                    LoadGameForAllClients(savedGame.FEN);
-                }
-                else
-                {
-                    // Clients should request the host to load the game
-                    RequestLoadGame(savedGame.FEN);
-                }
-            }
-            else
-            {
-                // In a local game, just load it directly
-                GameManager.Instance.LoadGame(savedGame.FEN);
+                Debug.LogWarning($"Error processing saved game: {e.Message}");
             }
         }
-        catch (Exception e)
-        {
-            Debug.LogError($"Error loading game: {e.Message}");
-            ShowStatus("Failed to load game: " + e.Message);
-            yield break;
-        }
         
-        // Wait a bit and then close the panel
-        yield return new WaitForSeconds(1.0f);
-        
-        if (loadGamePanel != null)
-            loadGamePanel.SetActive(false);
-            
-        ShowStatus($"Game '{savedGame.Name}' loaded successfully!");
+        Debug.Log($"Loaded {savedGames.Count} saved games.");
     }
     
     // Delete a saved game by ID
@@ -392,7 +424,7 @@ public class GameStateManager : MonoBehaviour
     {
         if (!firebaseInitialized || databaseReference == null)
         {
-            ShowStatus("Firebase not initialized. Try again later.");
+            Debug.LogWarning("Firebase not initialized. Can't delete game.");
             return;
         }
         
@@ -401,44 +433,32 @@ public class GameStateManager : MonoBehaviour
     
     private IEnumerator DeleteSavedGameCoroutine(string saveId)
     {
-        ShowStatus("Deleting saved game...");
+        Debug.Log($"Deleting saved game with ID: {saveId}...");
         
-        // Get the current user ID outside the try block
-        string userId = NetworkManager.Singleton != null 
-            ? NetworkManager.Singleton.LocalClientId.ToString() 
-            : SystemInfo.deviceUniqueIdentifier;
+        // Get user ID
+        string userId = GetCurrentUserId();
         
         // Delete from Firebase
         var deleteTask = databaseReference.Child("savedGames").Child(userId).Child(saveId).RemoveValueAsync();
-        yield return new WaitUntil(() => deleteTask.IsCompleted);
+        
+        while (!deleteTask.IsCompleted)
+        {
+            yield return null;
+        }
         
         if (deleteTask.Exception != null)
         {
             Debug.LogError($"Failed to delete saved game: {deleteTask.Exception}");
-            ShowStatus("Failed to delete saved game. Please try again.");
             yield break;
         }
         
-        ShowStatus("Saved game deleted successfully!");
+        // Remove from cached list
+        savedGames.RemoveAll(g => g.Id == saveId);
         
-        // Refresh the list
-        RefreshSavedGamesList();
+        Debug.Log("Saved game deleted successfully!");
     }
     
-    // Helper method to show status messages
-    private void ShowStatus(string message)
-    {
-        if (statusText != null)
-        {
-            statusText.text = message;
-        }
-        
-        Debug.Log(message);
-    }
-    
-    // Methods for networked game loading
-    // Note: These would be implemented as ServerRpc and ClientRpc in a NetworkBehaviour
-    
+    // Helper methods for networked game loading
     private void RequestLoadGame(string fenString)
     {
         Debug.Log($"Client would request server to load game: {fenString.Substring(0, Math.Min(20, fenString.Length))}...");
@@ -452,5 +472,25 @@ public class GameStateManager : MonoBehaviour
         
         // For now, just load it locally
         GameManager.Instance.LoadGame(fenString);
+    }
+    
+    // Utility method to get current user ID
+    private string GetCurrentUserId()
+    {
+        // If in a network game, use the client ID
+        if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsConnectedClient)
+        {
+            return NetworkManager.Singleton.LocalClientId.ToString();
+        }
+        
+        // Otherwise use device ID or a persistent user ID stored in PlayerPrefs
+        string userId = PlayerPrefs.GetString("UserId", "");
+        if (string.IsNullOrEmpty(userId))
+        {
+            userId = SystemInfo.deviceUniqueIdentifier;
+            PlayerPrefs.SetString("UserId", userId);
+        }
+        
+        return userId;
     }
 }
